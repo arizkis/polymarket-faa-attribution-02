@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+# Momentum-gate revision in progress.
 import json
 import math
 import os

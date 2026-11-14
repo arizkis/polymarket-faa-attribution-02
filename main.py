@@ -46,6 +46,15 @@ DECAY_RATE = 0.025
 DECAY_MEDIAN_FLOOR_FRACTION = 0.35
 CRASH_DRIFT_RATE = 0.035
 CRASH_FLOOR_FRAC = 0.25
+MOMENTUM_WINDOW_MINUTES = 240
+MOMENTUM_BLOCK_MINUTES = 30
+MOMENTUM_MIN_SPAN_MINUTES = 121
+MOMENTUM_SC_WEIGHT = 0.65
+MOMENTUM_AC_WEIGHT = 0.35
+MOMENTUM_GATE_RAMP_START = 0.45
+MOMENTUM_GATE_RAMP_WIDTH = 0.30
+MOMENTUM_RHO_MAX = 0.25
+MOMENTUM_DRIFT_CLAMP = 0.6
 
 
 def logit(price):
@@ -449,6 +458,93 @@ def apply_crash_drift(market, rows, quantiles):
             row[index] = sigmoid(logit(value) + actual_logit_shift)
 
 
+def momentum_gate(market):
+    series = market["series"]
+    window = min(MOMENTUM_WINDOW_MINUTES, len(series) - 1)
+    if window < MOMENTUM_MIN_SPAN_MINUTES:
+        return 0.0
+
+    block_count = window // MOMENTUM_BLOCK_MINUTES
+    span = block_count * MOMENTUM_BLOCK_MINUTES
+    span_start = len(series) - 1 - span
+    total_change = series[-1] - series[span_start]
+    if total_change == 0:
+        return 0.0
+
+    block_returns = []
+    for block_index in range(block_count):
+        start = span_start + block_index * MOMENTUM_BLOCK_MINUTES
+        end = start + MOMENTUM_BLOCK_MINUTES
+        block_returns.append(series[end] - series[start])
+
+    nonzero_returns = [change for change in block_returns if change != 0]
+    total_weight = sum(abs(change) for change in nonzero_returns)
+    aligned_weight = sum(
+        abs(change)
+        for change in nonzero_returns
+        if (change > 0) == (total_change > 0)
+    )
+    consistency = aligned_weight / total_weight if total_weight else 0.0
+    consistency_score = min(1.0, max(0.0, (consistency - 0.5) / 0.5))
+
+    if block_count < 2:
+        autocorrelation = consistency_score
+    else:
+        previous = block_returns[:-1]
+        following = block_returns[1:]
+        previous_mean = sum(previous) / len(previous)
+        following_mean = sum(following) / len(following)
+        previous_centered = [value - previous_mean for value in previous]
+        following_centered = [value - following_mean for value in following]
+        previous_variance = sum(value * value for value in previous_centered)
+        following_variance = sum(value * value for value in following_centered)
+        if previous_variance == 0 or following_variance == 0:
+            autocorrelation = consistency_score
+        else:
+            covariance = sum(
+                left * right
+                for left, right in zip(previous_centered, following_centered)
+            )
+            autocorrelation = min(
+                1.0,
+                max(
+                    0.0,
+                    covariance / math.sqrt(previous_variance * following_variance),
+                ),
+            )
+
+    evidence = (
+        MOMENTUM_SC_WEIGHT * consistency_score
+        + MOMENTUM_AC_WEIGHT * autocorrelation
+    )
+    return min(
+        1.0,
+        max(
+            0.0,
+            (evidence - MOMENTUM_GATE_RAMP_START) / MOMENTUM_GATE_RAMP_WIDTH,
+        ),
+    )
+
+
+def apply_momentum_drift(market, rows, quantiles):
+    gate = momentum_gate(market)
+    if gate <= 0:
+        return
+
+    series = market["series"]
+    window = min(MOMENTUM_WINDOW_MINUTES, len(series) - 1)
+    block_count = window // MOMENTUM_BLOCK_MINUTES
+    span = block_count * MOMENTUM_BLOCK_MINUTES
+    span_start = len(series) - 1 - span
+    total_change = series[-1] - series[span_start]
+    rho = MOMENTUM_RHO_MAX * gate
+    for horizon, row in enumerate(rows, start=1):
+        delta = rho * total_change * (horizon / MOMENTUM_WINDOW_MINUTES)
+        delta = min(MOMENTUM_DRIFT_CLAMP, max(-MOMENTUM_DRIFT_CLAMP, delta))
+        for index, value in enumerate(row):
+            row[index] = sigmoid(logit(value) + delta)
+
+
 def apply_sum_reversion(entries, forecast_rows, quantiles):
     market_count = len(entries)
     initial_sum = sum(entry[2] for entry in entries)
@@ -707,6 +803,7 @@ def forecast_case(case_data):
                 apply_crash_drift(market, rows, quantiles)
             else:
                 apply_decay_drift(market, rows, quantiles)
+            apply_momentum_drift(market, rows, quantiles)
             forecast = finish_forecast(market, rows)
             if any(
                 not math.isfinite(value)
